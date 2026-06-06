@@ -1,14 +1,16 @@
 package main
 
 import (
-	"flag"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
+	"strconv"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/progress"
+	"github.com/charmbracelet/huh"
 	"github.com/kejlerj/upgrade-picvid/convert"
 	"github.com/kejlerj/upgrade-picvid/files"
 )
@@ -37,6 +39,8 @@ func checkDependencies() {
 	}
 }
 
+var bar = progress.New(progress.WithDefaultGradient())
+
 func printProgress(current, total float64) {
 	if total == 0 {
 		return
@@ -47,13 +51,8 @@ func printProgress(current, total float64) {
 		pct = 1
 	}
 
-	barWidth := 40
-	filled := int(pct * float64(barWidth))
-
-	bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
-
 	// \r goes back to start of line — rewrites in place instead of new lines
-	fmt.Printf("\r  [%s] %3.0f%%", bar, pct*100)
+	fmt.Printf("\r  %s", bar.ViewAs(pct))
 }
 
 func processVideosFiles(folder string, recursive bool, crf int, preset string) error {
@@ -89,57 +88,133 @@ func processVideosFiles(folder string, recursive bool, crf int, preset string) e
 		if extension != "" {
 			newFilePath = strings.Replace(file, extension, ".mp4", 1)
 		} else {
-			newFilePath = strings.Join([]string{file, ".mp4"}, "")
+			newFilePath = file + ".mp4"
 		}
 		newFilePath = strings.ReplaceAll(newFilePath, " ", "_")
 
 		err := convert.ConvertToH264(file, newFilePath, crf, preset)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error converting video: %s: %v\n", file, err)
+			fmt.Fprintf(os.Stderr, "\nError converting video: %s: %v\n", file, err)
 			continue
 		}
 		tmpFilePath := filepath.Join(tmpFolder, filepath.Base(file))
 		err = os.Rename(file, tmpFilePath)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error moving file: %s: %v\n", file, err)
+			fmt.Fprintf(os.Stderr, "\nError moving file: %s: %v\n", file, err)
 			continue
 		}
 	}
 	printProgress(float64(length), float64(length))
 	fmt.Println()
 	fmt.Println("Conversion complete")
-	fmt.Printf("Old files are in: %s you can delete them if you want\n", tmpFolder)
+	fmt.Printf("Old files are in: %s — you can delete them if you want\n", tmpFolder)
 	return nil
 }
 
 var presets = []string{"ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"}
 
+func expandHome(path string) string {
+	if path == "~" || path == "~/" {
+		home, _ := os.UserHomeDir()
+		return home + "/"
+	}
+	if strings.HasPrefix(path, "~/") {
+		home, _ := os.UserHomeDir()
+		return home + "/" + path[2:]
+	}
+	return path
+}
+
+type config struct {
+	folder    string
+	recursive bool
+	crf       int
+	preset    string
+}
+
+func promptConfig() (config, error) {
+	var folder, crfStr, preset string
+	var recursive bool
+
+	crfStr = "18"
+	preset = "medium"
+
+	presetOptions := make([]huh.Option[string], len(presets))
+	for i, p := range presets {
+		presetOptions[i] = huh.NewOption(p, p)
+	}
+
+	form := huh.NewForm(
+		huh.NewGroup(
+			huh.NewInput().
+				Title("Folder to scan").
+				Value(&folder).
+				Validate(func(s string) error {
+					if strings.TrimSpace(s) == "" {
+						return errors.New("folder is required")
+					}
+					if _, err := os.Stat(expandHome(s)); err != nil {
+						return errors.New("folder does not exist")
+					}
+					return nil
+				}),
+		),
+		huh.NewGroup(
+			huh.NewConfirm().
+				Title("Scan subfolders recursively?").
+				Value(&recursive),
+		),
+		huh.NewGroup(
+			huh.NewInput().
+				Title("CRF quality (0–51)").
+				Description("Lower = better quality, larger file. 18 is visually near-lossless.").
+				Placeholder("18").
+				Value(&crfStr).
+				Validate(func(s string) error {
+					if s == "" {
+						return errors.New("CRF value is required")
+					}
+					n, err := strconv.Atoi(s)
+					if err != nil || n < 0 || n > 51 {
+						return errors.New("must be an integer between 0 and 51")
+					}
+					return nil
+				}),
+		),
+		huh.NewGroup(
+			huh.NewSelect[string]().
+				Title("Encoding preset").
+				Description("Slower = smaller file, same quality.").
+				Options(presetOptions...).
+				Value(&preset),
+		),
+	)
+
+	if err := form.Run(); err != nil {
+		return config{}, err
+	}
+
+	crf, _ := strconv.Atoi(crfStr)
+
+	return config{
+		folder:    expandHome(folder),
+		recursive: recursive,
+		crf:       crf,
+		preset:    preset,
+	}, nil
+}
+
 func main() {
-	folder := flag.String("folder", "", "folder to scan")
-	recursive := flag.Bool("recursive", false, "scan recursively")
-	crf := flag.Int("crf", 18, "CRF value")
-	preset := flag.String("preset", "medium", "preset value")
-
-	flag.Parse()
-
-	if *folder == "" {
-		fmt.Fprintf(os.Stderr, "Folder is required\n")
-		os.Exit(1)
-	}
-	if *crf < 0 || *crf > 51 {
-		fmt.Fprintf(os.Stderr, "CRF value must be between 0 and 51\n")
-		os.Exit(1)
-	}
-	if !slices.Contains(presets, *preset) {
-		fmt.Fprintf(os.Stderr, "Preset value must be one of: %s\n", strings.Join(presets, ", "))
+	cfg, err := promptConfig()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 
 	checkDependencies()
 
-	err := processVideosFiles(*folder, *recursive, *crf, *preset)
-	if err != nil {
+	if err := processVideosFiles(cfg.folder, cfg.recursive, cfg.crf, cfg.preset); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return
+		os.Exit(1)
 	}
 }
